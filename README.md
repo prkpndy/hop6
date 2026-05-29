@@ -229,3 +229,12 @@ automatically once it's healthy again; watch the `*system` pane for status.
 [`ratatui`]: https://ratatui.rs
 [`crossterm`]: https://docs.rs/crossterm
 [`tokio`]: https://tokio.rs
+
+## License
+
+Licensed under either of
+
+- MIT license ([LICENSE-MIT](./LICENSE-MIT))
+- Apache License, Version 2.0 ([LICENSE-APACHE](./LICENSE-APACHE))
+
+at your option.

@@ -3,6 +3,12 @@ name = "hop6"
 version = "0.1.0"
 edition = "2021"
 description = "Serverless, peer-to-peer terminal messenger that speaks exclusively over Tor v3 onion services"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/prkpndy/hop6"
+homepage = "https://github.com/prkpndy/hop6"
+readme = "README.md"
+keywords = ["tor", "onion", "chat", "tui", "p2p"]
+categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 # TUI. ratatui 0.30 bundles (and re-exports) crossterm 0.29 via its default backend feature.
