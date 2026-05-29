@@ -10,7 +10,6 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
@@ -43,43 +42,11 @@ pub fn load(path: &Path) -> Result<Book> {
     }
 }
 
-/// Persist the address book with owner-only permissions (`0700` dir, `0600` file).
+/// Persist the address book as an owner-only file (`0600` in a `0700` dir) — it reveals your
+/// social graph.
 pub fn save(path: &Path, book: &Book) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)
-            .with_context(|| format!("creating contacts directory {}", dir.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
-        }
-    }
     let json = serde_json::to_vec_pretty(book).context("serializing contacts")?;
-    write_private(path, &json).with_context(|| format!("writing contacts file {}", path.display()))
-}
-
-#[cfg(unix)]
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    f.write_all(bytes)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)?;
-    f.write_all(bytes)?;
-    Ok(())
+    crate::fsutil::write_private(path, &json)
 }
 
 #[cfg(test)]

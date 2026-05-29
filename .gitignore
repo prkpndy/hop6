@@ -17,3 +17,4 @@
 
 # Persisted address book (your social graph — keep it private)
 contacts.json
+*-contacts.json

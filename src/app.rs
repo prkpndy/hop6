@@ -375,6 +375,10 @@ impl App {
                 if self.active.is_none() {
                     self.active = Some(peer);
                 }
+                // If this connection's identity is already known (outbound), fold any stale
+                // entry for the same onion into it. (Inbound onion is unknown until the first
+                // message; that merge happens in the Message arm below.)
+                self.merge_duplicates(peer);
             }
             NetEvent::PeerDisconnected { peer } => {
                 let onion = self.peers.get_mut(&peer).map(|p| {
@@ -396,9 +400,11 @@ impl App {
                 // Resolve the sender's display name (contact name if known) before borrowing peers.
                 let who = self.display_name(&msg.from_onion);
                 // Learn an inbound peer's identity from its first message.
+                let mut learned = false;
                 if let Some(p) = self.peers.get_mut(&peer) {
                     if p.onion.is_empty() && !msg.from_onion.is_empty() {
                         p.onion = msg.from_onion.clone();
+                        learned = true;
                     }
                     p.log.push(ChatLine {
                         from_me: false,
@@ -410,6 +416,11 @@ impl App {
                     }
                 } else {
                     self.sys(format!("[{peer}] message from unknown peer dropped"));
+                }
+                // Now that we know who this inbound peer is, reattach the history of any earlier
+                // (now-disconnected) conversation with the same onion — e.g. after a reconnect.
+                if learned {
+                    self.merge_duplicates(peer);
                 }
             }
             NetEvent::Status(s) => {
@@ -423,6 +434,56 @@ impl App {
         if !self.order.contains(&peer) {
             self.order.push(peer);
         }
+    }
+
+    /// Fold any stale (disconnected) conversations that share `live`'s onion into `live`,
+    /// preserving chronological order, then drop them. This consolidates the duplicate entries
+    /// that otherwise appear on the *receiving* side after a reconnect: Tor hides the caller, so
+    /// each reconnect arrives as a fresh `PeerId`, and we can only tell it's the same identity
+    /// once a message reveals the onion. The live connection is kept (the network routes by its
+    /// id); the older entries' history is prepended to it.
+    fn merge_duplicates(&mut self, live: PeerId) {
+        let onion = match self.peers.get(&live) {
+            Some(p) if !p.onion.is_empty() => normalize_onion(&p.onion),
+            _ => return,
+        };
+        let dups: Vec<PeerId> = self
+            .order
+            .iter()
+            .copied()
+            .filter(|&id| id != live)
+            .filter(|id| {
+                self.peers.get(id).is_some_and(|p| {
+                    !p.connected && !p.onion.is_empty() && normalize_onion(&p.onion) == onion
+                })
+            })
+            .collect();
+        if dups.is_empty() {
+            return;
+        }
+
+        // Collect the stale logs in roster order (oldest sessions first).
+        let mut history: Vec<ChatLine> = Vec::new();
+        for id in &dups {
+            if let Some(p) = self.peers.remove(id) {
+                history.extend(p.log);
+            }
+            self.order.retain(|o| o != id);
+            if self.active == Some(*id) {
+                self.active = Some(live);
+            }
+        }
+
+        // Prepend that history to the live conversation.
+        if let Some(p) = self.peers.get_mut(&live) {
+            history.append(&mut p.log);
+            p.log = history;
+        }
+
+        let label = self.display_name(&onion);
+        self.sys(format!(
+            "reattached earlier conversation with {label} into [{live}]"
+        ));
     }
 
     /// No-op hook for periodic ticks (kept for future animations / timeouts).
@@ -561,6 +622,35 @@ mod tests {
         assert_eq!(app.display_name("abc.onion"), "alice");
         assert_eq!(app.display_name("abc"), "alice");
         assert_eq!(app.display_name(""), "(incoming)");
+    }
+
+    #[test]
+    fn inbound_reconnect_merges_into_one_conversation() {
+        let mut app = app();
+
+        // First inbound session from Alice: connects, sends a message (revealing identity).
+        app.apply_net_event(NetEvent::PeerConnected { peer: 1, onion: String::new(), inbound: true });
+        app.apply_net_event(NetEvent::Message {
+            peer: 1,
+            msg: WireMsg::new("alice.onion", "before reset", 1),
+        });
+        // Connection drops (Tor restart).
+        app.apply_net_event(NetEvent::PeerDisconnected { peer: 1 });
+        assert!(!app.peers[&1].connected);
+
+        // Alice auto-reconnects: a brand-new inbound PeerId, identity unknown until her message.
+        app.apply_net_event(NetEvent::PeerConnected { peer: 2, onion: String::new(), inbound: true });
+        app.apply_net_event(NetEvent::Message {
+            peer: 2,
+            msg: WireMsg::new("alice.onion", "after reset", 2),
+        });
+
+        // The stale entry [1] is folded into the live entry [2]: one conversation, full history.
+        assert!(!app.peers.contains_key(&1), "stale duplicate should be removed");
+        assert_eq!(app.order, vec![2]);
+        let bodies: Vec<&str> = app.peers[&2].log.iter().map(|c| c.body.as_str()).collect();
+        assert_eq!(bodies, vec!["before reset", "after reset"]);
+        assert_eq!(app.active, Some(2), "active follows the surviving entry");
     }
 
     #[test]

@@ -23,6 +23,7 @@
 
 mod app;
 mod contacts;
+mod fsutil;
 mod message;
 mod network;
 mod tor;
@@ -55,17 +56,13 @@ async fn main() -> Result<()> {
     // Publish our onion BEFORE entering the alternate screen, so any Tor error is printed
     // plainly to the normal terminal instead of being clobbered by the TUI. The key is loaded
     // from disk (or generated on first run) so the address is stable across restarts.
-    let tor::Identity { onion, control, key_path, created } = tor::start_onion(local_port)
+    let tor::Identity { onion, control, key, key_path, created } = tor::start_onion(local_port)
         .await
         .context("failed to publish onion service")?;
 
-    // Keep the control connection alive for the whole program: dropping it tears down the
-    // onion service (created with detach=false). Parking it in a task that owns it is the
-    // simplest way to tie its lifetime to the process.
-    tokio::spawn(async move {
-        let _control = control;
-        std::future::pending::<()>().await;
-    });
+    // Keep the onion alive for the whole program AND re-publish it if the control connection
+    // dies (e.g. after the laptop sleeps), so inbound reachability self-heals without a restart.
+    tokio::spawn(tor::supervise(control, key, local_port, net_tx.clone()));
 
     // Spawn the network manager (inbound listener + outbound dialer + per-peer tasks).
     {

@@ -13,12 +13,12 @@ its own `.onion` address and connects directly to peers' onion addresses through
 
 ```
 ┌─ status ─ you: <your .onion> · online ─────────────────────┐
-├─ peers ───┬─ chat · [2] abc12345… ────────────────────────┤
-│ ▶ *system │ me: hello over tor                              │
-│   [2] ab… │ abc12345…: hi back                              │
+├─ peers ───┬─ chat · [2] abc12345… ─────────────────────────┤
+│ ▶ *system │ me: hello over tor                             │
+│   [2] ab… │ abc12345…: hi back                             │
 ├───────────┴─ input (Enter=send · /help) ───────────────────┤
-│ > _                                                         │
-└─────────────────────────────────────────────────────────────┘
+│ > _                                                        │
+└────────────────────────────────────────────────────────────┘
 ```
 
 ## Prerequisites
@@ -190,17 +190,41 @@ the same across restarts (see [Persistent identity](#persistent-identity)).
   verify that the *sender* of an inbound message owns the onion it claims in `from_onion`. Don't
   treat identities as cryptographically proven.
 - **No message persistence** — history is in-memory and lost on quit.
-- **No offline delivery / retries** — if a peer is unreachable the dial simply fails.
+- **No store-and-forward** — messages can only be sent while a peer is connected (the input is
+  blocked for offline peers); there's no queued/offline delivery.
 - Inbound connections show as `(incoming)` until the peer's first message reveals its address.
+- **Brief duplicate entry on reconnect (receiving side).** When an outbound peer auto-reconnects
+  after a drop, the *inbound* side sees a brand-new connection (Tor hides the caller), so it
+  momentarily appears as a second entry. As soon as the reconnecting peer's first message reveals
+  its onion, that entry is **merged** back into the original conversation (history preserved) and
+  the stale one is dropped — so the duplicate only lasts until the first post-reconnect message.
+
+### Resilience (sleep / network changes)
+
+hop6 tries to survive a laptop sleeping or the network changing under it:
+
+- **Heartbeat.** Each connection exchanges ping/pong every ~15s; if nothing is heard for ~45s
+  the link is declared dead (otherwise a silently-dropped Tor circuit would look "connected"
+  forever). The peer then shows offline.
+- **Auto-reconnect (outbound).** Peers you dialed reconnect automatically with exponential
+  backoff (2s → 30s) until they come back or you `/disconnect` — so a conversation heals itself
+  once Tor recovers. Inbound peers can't be redialed by us; the remote's auto-reconnect
+  re-establishes them.
+- **Onion re-publish.** A background supervisor probes the Tor control connection every ~30s; if
+  it died (sleep / Tor restart) it reconnects and re-publishes the **same** onion address,
+  restoring inbound reachability without a manual restart.
+
+Note: right after waking, give Tor a short while to rebuild circuits — reconnects land
+automatically once it's healthy again; watch the `*system` pane for status.
 
 ## Troubleshooting
 
-| symptom | fix |
-|---|---|
-| `could not reach Tor control port` | Tor isn't running, or `ControlPort 9051` isn't set. Start `tor -f ./torrc.sample`. |
-| `Tor offered no usable auth method` | add `CookieAuthentication 1` to your torrc. |
-| `failed to read Tor auth cookie` | Tor runs as another user; add `CookieAuthFileGroupReadable 1` and join Tor's group. |
-| `could not connect to <onion>` | peer offline, wrong address, or its onion not yet published — wait and retry. |
+| symptom                             | fix                                                                                 |
+|-------------------------------------|-------------------------------------------------------------------------------------|
+| `could not reach Tor control port`  | Tor isn't running, or `ControlPort 9051` isn't set. Start `tor -f ./torrc.sample`.  |
+| `Tor offered no usable auth method` | add `CookieAuthentication 1` to your torrc.                                         |
+| `failed to read Tor auth cookie`    | Tor runs as another user; add `CookieAuthFileGroupReadable 1` and join Tor's group. |
+| `could not connect to <onion>`      | peer offline, wrong address, or its onion not yet published — wait and retry.       |
 
 [`ratatui`]: https://ratatui.rs
 [`crossterm`]: https://docs.rs/crossterm

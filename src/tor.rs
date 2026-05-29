@@ -21,17 +21,25 @@
 
 use std::fs;
 use std::future::Ready;
-use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
+use tokio::time::{self, Duration};
 use torut::control::{AsyncEvent, AuthenticatedConn, ConnError, UnauthenticatedConn};
 use torut::onion::TorSecretKeyV3;
 
+use crate::message::NetEvent;
+
 /// Length of a serialized v3 secret key (expanded ed25519 secret key).
 const KEY_LEN: usize = 64;
+
+/// How often the supervisor probes the control connection for liveness.
+const CONTROL_HEALTH_INTERVAL: Duration = Duration::from_secs(30);
+/// How long to wait between failed re-publish attempts (e.g. while Tor re-bootstraps after wake).
+const CONTROL_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 /// torut's `AuthenticatedConn` is generic over an async-event-handler type `H` bound by
 /// `H: Fn(AsyncEvent<'static>) -> impl Future<Output = Result<(), ConnError>>`. We never
@@ -47,12 +55,14 @@ pub type Control = AuthenticatedConn<TcpStream, NoopHandler>;
 pub const CONTROL_ADDR: &str = "127.0.0.1:9051";
 
 /// The result of publishing our onion service. `control` must be kept alive for the whole
-/// program (dropping it tears the service down).
+/// program (dropping it tears the service down) — hand it, plus `key`, to [`supervise`].
 pub struct Identity {
     /// Our `.onion` address (with the `.onion` suffix).
     pub onion: String,
     /// The live, authenticated control-port connection.
     pub control: Control,
+    /// The persisted secret key — needed to re-publish the same address after a reset.
+    pub key: TorSecretKeyV3,
     /// Where the secret key is persisted.
     pub key_path: PathBuf,
     /// `true` if we generated a brand-new key this run, `false` if we reloaded an existing one.
@@ -63,10 +73,24 @@ pub struct Identity {
 /// `onion:80 -> 127.0.0.1:local_port`, using a **persisted** key so the address is stable
 /// across restarts (see module docs).
 pub async fn start_onion(local_port: u16) -> Result<Identity> {
-    // 0. Load (or first-time generate) our persistent identity key.
     let key_path = identity_path()?;
     let (key, created) = load_or_generate_key(&key_path)?;
+    let control = connect_and_publish(&key, local_port).await?;
+    let onion = key.public().get_onion_address().to_string();
+    Ok(Identity {
+        onion,
+        control,
+        key,
+        key_path,
+        created,
+    })
+}
 
+/// Open a control connection, cookie-authenticate, and publish `key`'s v3 onion service mapping
+/// virtual port 80 → `127.0.0.1:local_port`. Used both for the initial publish and to re-publish
+/// after the control connection is lost. The port mapping is supplied on every publish — it is
+/// independent of the key, which fixes only the address.
+async fn connect_and_publish(key: &TorSecretKeyV3, local_port: u16) -> Result<Control> {
     // 1. Connect to the control port.
     let stream = TcpStream::connect(CONTROL_ADDR)
         .await
@@ -95,16 +119,14 @@ pub async fn start_onion(local_port: u16) -> Result<Identity> {
     // 3. Upgrade to an authenticated connection (no-op event handler — see NoopHandler).
     let mut aconn: Control = uconn.into_authenticated::<NoopHandler>().await;
 
-    // 4. Publish the service for our persisted key. The port mapping is supplied here on every
-    //    run — it is independent of the key (which fixes only the address).
+    // 4. Publish the service.
     let local: SocketAddr = format!("127.0.0.1:{local_port}")
         .parse()
         .expect("valid loopback socket addr");
-    // Map remote virtual port 80 -> our local listener.
     let listeners = [(80u16, local)];
     aconn
         .add_onion_v3(
-            &key,
+            key,
             /* detach */ false,
             /* non_anonymous */ false,
             /* max_streams_close_circuit */ false,
@@ -113,10 +135,53 @@ pub async fn start_onion(local_port: u16) -> Result<Identity> {
         )
         .await
         .context("ADD_ONION failed (control port reachable but service publish rejected)")?;
+    Ok(aconn)
+}
 
-    // 5. Derive our public .onion address from the key.
-    let onion = key.public().get_onion_address().to_string();
-    Ok(Identity { onion, control: aconn, key_path, created })
+/// Keep the onion service alive for the program's lifetime.
+///
+/// Holding `control` keeps the ephemeral service published (it was created with `detach=false`).
+/// We additionally **probe the connection** every [`CONTROL_HEALTH_INTERVAL`]; if it has died
+/// — typically after the laptop slept or Tor restarted — we reconnect and re-publish the **same
+/// onion** (the address is derived from `key`, so it never changes), restoring inbound
+/// reachability without a manual restart. This future never returns; spawn it as a task.
+pub async fn supervise(
+    mut control: Control,
+    key: TorSecretKeyV3,
+    local_port: u16,
+    to_ui: mpsc::UnboundedSender<NetEvent>,
+) {
+    let mut check = time::interval(CONTROL_HEALTH_INTERVAL);
+    check.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    loop {
+        check.tick().await;
+
+        // `noop()` round-trips a real command (GETINFO version) to Tor; an error means the
+        // control connection is dead and our onion is no longer published.
+        if control.noop().await.is_ok() {
+            continue;
+        }
+
+        let _ = to_ui.send(NetEvent::Status(
+            "Tor control connection lost — re-publishing onion…".into(),
+        ));
+        loop {
+            match connect_and_publish(&key, local_port).await {
+                Ok(new_control) => {
+                    control = new_control;
+                    let _ = to_ui.send(NetEvent::Status(
+                        "onion re-published — inbound restored".into(),
+                    ));
+                    break;
+                }
+                Err(e) => {
+                    let _ = to_ui
+                        .send(NetEvent::Status(format!("re-publish failed: {e} — retrying…")));
+                    time::sleep(CONTROL_RETRY_DELAY).await;
+                }
+            }
+        }
+    }
 }
 
 /// Resolve the identity-key file path: `$HOP6_IDENTITY` if set, else
@@ -157,45 +222,10 @@ fn load_or_generate_key(path: &Path) -> Result<(TorSecretKeyV3, bool)> {
     }
 }
 
-/// Persist the secret key, creating the parent directory and locking down permissions
-/// (`0700` dir, `0600` file) so the key is not world-readable.
+/// Persist the secret key as an owner-only file (`0600` in a `0700` dir) so it is not
+/// world-readable — treat it like an SSH private key.
 fn save_key(path: &Path, key: &TorSecretKeyV3) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)
-            .with_context(|| format!("creating identity directory {}", dir.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
-        }
-    }
-    write_private(path, &key.as_bytes())
-        .with_context(|| format!("writing identity file {}", path.display()))
-}
-
-/// Write `bytes` to `path` with owner-only permissions where the platform supports it.
-#[cfg(unix)]
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    f.write_all(bytes)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)?;
-    f.write_all(bytes)?;
-    Ok(())
+    crate::fsutil::write_private(path, &key.as_bytes())
 }
 
 /// Strip a trailing `.onion` (and any `:port`) from a user-entered address, returning the bare

@@ -1,15 +1,26 @@
-//! The network layer: a single **connection-manager** task plus one **peer task** per live
-//! connection. None of this code ever touches the TUI — it speaks only in [`NetEvent`]s (out)
-//! and [`UiCommand`]s (in), so the render loop can never be blocked by a slow Tor circuit.
+//! The network layer: a single **connection-manager** task plus one **peer task** per
+//! conversation. None of this code touches the TUI — it speaks only in [`NetEvent`]s (out) and
+//! [`UiCommand`]s (in), so the render loop can never be blocked by a slow Tor circuit.
+//!
+//! ## Resilience
+//!
+//! Each live connection runs a **heartbeat** ([`Frame::Ping`]/[`Frame::Pong`]): if no frame
+//! arrives within [`LIVENESS_TIMEOUT`], the link is declared dead. This is what lets us notice a
+//! connection that silently died while the laptop slept (no I/O ⇒ no EOF otherwise).
+//!
+//! **Outbound** peers (the ones we dialed, whose onion we know) **auto-reconnect** with
+//! exponential backoff after any non-deliberate drop, so a conversation heals itself once Tor
+//! recovers / the peer comes back. **Inbound** peers can't be redialed by us (Tor hides the
+//! caller), so they simply end; the remote's auto-reconnect re-establishes them.
 //!
 //! ```text
-//!                          ┌───────────────── manager task ─────────────────┐
-//!   TcpListener (inbound) ─┤ accept → assign PeerId → spawn peer task         │
-//!   UiCommand::Connect ────┤ dial via SOCKS5 (own task) → spawn peer task     │
-//!   UiCommand::Send ───────┤ build WireMsg → route to that peer's line_tx     │
-//!   UiCommand::Disconnect ─┤ drop the peer's line_tx (closes its task)        │
-//!   peer task finished ────┤ remove from roster map                           │
-//!                          └─────────────────────────────────────────────────┘
+//!                          ┌───────────────── manager task ────────────────────┐
+//!   TcpListener (inbound) ─┤ accept → PeerId → spawn inbound peer task         │
+//!   UiCommand::Connect ────┤ PeerId → spawn outbound peer task (dial+retry)    │
+//!   UiCommand::Send ───────┤ build Frame::Msg → route to that peer's line_tx   │
+//!   UiCommand::Disconnect ─┤ drop the peer's line_tx (stops its task for good) │
+//!   peer task finished ────┤ remove from roster map                            │
+//!                          └───────────────────────────────────────────────────┘
 //! ```
 
 use std::collections::HashMap;
@@ -20,19 +31,28 @@ use futures::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
+use tokio::time::{self, Duration, Instant};
 use tokio_socks::tcp::Socks5Stream;
 use tokio_util::codec::{Framed, LinesCodec};
 
 use crate::message::{NetEvent, PeerId, UiCommand};
 use crate::tor;
-use crate::wire::WireMsg;
+use crate::wire::{Frame, WireMsg};
 
 /// Tor's local SOCKS5 proxy (`SocksPort 9050` in torrc).
 pub const SOCKS_ADDR: &str = "127.0.0.1:9050";
 /// Virtual port our onion service exposes (and the port we dial peers on).
 pub const ONION_VIRTUAL_PORT: u16 = 80;
 
-/// Current Unix time in whole seconds (best-effort; only used as a display hint).
+/// How often each connection sends a heartbeat ping.
+const PING_INTERVAL: Duration = Duration::from_secs(15);
+/// Declare a connection dead if nothing is received within this window (~3 missed pings).
+const LIVENESS_TIMEOUT: Duration = Duration::from_secs(45);
+/// First outbound reconnect delay; doubles up to [`RECONNECT_BACKOFF_MAX`].
+const RECONNECT_BACKOFF_START: Duration = Duration::from_secs(2);
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// Current Unix time in whole seconds (best-effort display hint only).
 fn now_ts() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -40,27 +60,40 @@ fn now_ts() -> u64 {
         .unwrap_or(0)
 }
 
+fn ping_line() -> String {
+    Frame::Ping.to_line().expect("serialize ping")
+}
+fn pong_line() -> String {
+    Frame::Pong.to_line().expect("serialize pong")
+}
+
+/// Why a single connection ended.
+enum ConnEnd {
+    /// The manager closed our line channel — a deliberate `/disconnect` or shutdown. Stop.
+    LocalClosed,
+    /// The connection broke (EOF, I/O error, or heartbeat timeout). Outbound peers reconnect.
+    Lost(String),
+}
+
 /// Entry point for the network layer. Binds the inbound listener, then runs the manager loop
 /// until the UI sends [`UiCommand::Shutdown`] (or its command channel closes).
 ///
-/// `own_onion` is our published `.onion`, stamped into every outgoing [`WireMsg`] so peers can
-/// label us — important for inbound connections, where Tor doesn't reveal who connected.
+/// `own_onion` is stamped into every outgoing [`WireMsg`] so peers can label us — important for
+/// inbound connections, where Tor doesn't reveal who connected.
 pub async fn run(
     local_port: u16,
     own_onion: String,
     to_ui: mpsc::UnboundedSender<NetEvent>,
     mut from_ui: mpsc::UnboundedReceiver<UiCommand>,
 ) -> Result<()> {
-    // Bind the loopback listener that Tor forwards inbound onion traffic to.
     let listener = TcpListener::bind(("127.0.0.1", local_port)).await?;
     let _ = to_ui.send(NetEvent::Status(format!(
         "listening for inbound peers on 127.0.0.1:{local_port}"
     )));
 
-    // Inbound accepts arrive here from a dedicated accept task so the manager loop never blocks.
+    // Inbound accepts arrive here from a dedicated accept task so the manager never blocks.
     let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<TcpStream>();
     tokio::spawn(async move {
-        // Ends when the listener errors; `break` when the manager has gone away.
         while let Ok((stream, _addr)) = listener.accept().await {
             if inbound_tx.send(stream).is_err() {
                 break; // manager gone
@@ -68,7 +101,7 @@ pub async fn run(
         }
     });
 
-    // Peer tasks report their own termination here so the manager can prune the roster map.
+    // Peer tasks report their own (final) termination here so the manager can prune the map.
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<PeerId>();
 
     // PeerId -> sender of already-serialized JSON lines destined for that peer.
@@ -77,24 +110,23 @@ pub async fn run(
 
     loop {
         tokio::select! {
-            // ── UI commands ────────────────────────────────────────────────────────────
             cmd = from_ui.recv() => match cmd {
                 Some(UiCommand::Connect { onion }) => {
                     let id = next_id; next_id += 1;
                     let (line_tx, line_rx) = mpsc::unbounded_channel::<String>();
                     peers.insert(id, line_tx);
-                    spawn_dialer(id, onion, line_rx, to_ui.clone(), done_tx.clone());
+                    spawn_outbound(id, onion, line_rx, to_ui.clone(), done_tx.clone());
                 }
                 Some(UiCommand::Send { peer, body }) => {
                     if let Some(tx) = peers.get(&peer) {
-                        match WireMsg::new(own_onion.clone(), body, now_ts()).to_line() {
+                        match Frame::Msg(WireMsg::new(own_onion.clone(), body, now_ts())).to_line() {
                             Ok(line) => { let _ = tx.send(line); }
                             Err(e) => { let _ = to_ui.send(NetEvent::Status(format!("encode error: {e}"))); }
                         }
                     }
                 }
                 Some(UiCommand::Disconnect { peer }) => {
-                    // Dropping the sender closes the peer task's line channel → it exits.
+                    // Dropping the sender closes the peer task's line channel → it stops for good.
                     if peers.remove(&peer).is_some() {
                         let _ = to_ui.send(NetEvent::PeerDisconnected { peer });
                     }
@@ -102,21 +134,16 @@ pub async fn run(
                 Some(UiCommand::Shutdown) | None => break,
             },
 
-            // ── Inbound connections ───────────────────────────────────────────────────
             Some(stream) = inbound_rx.recv() => {
                 let id = next_id; next_id += 1;
                 let (line_tx, line_rx) = mpsc::unbounded_channel::<String>();
                 peers.insert(id, line_tx);
-                // onion is unknown until the remote sends its first message (Tor hides the
-                // caller's identity); App fills it in from WireMsg::from_onion.
+                // onion is unknown until the remote's first message (Tor hides the caller).
                 let _ = to_ui.send(NetEvent::PeerConnected { peer: id, onion: String::new(), inbound: true });
-                let framed = Framed::new(stream, LinesCodec::new());
-                tokio::spawn(peer_loop(framed, id, to_ui.clone(), line_rx, done_tx.clone()));
+                spawn_inbound(stream, id, line_rx, to_ui.clone(), done_tx.clone());
             }
 
-            // ── Peer task finished ──────────────────────────────────────────────────────
             Some(id) = done_rx.recv() => {
-                // peer_loop already emitted PeerDisconnected / PeerError; just prune the map.
                 peers.remove(&id);
             }
         }
@@ -125,85 +152,152 @@ pub async fn run(
     Ok(())
 }
 
-/// Dial an outbound peer through Tor's SOCKS5 proxy, then run its [`peer_loop`]. Runs in its
-/// own task so a slow circuit (or an unreachable onion) never stalls the manager.
-fn spawn_dialer(
+/// Run an accepted inbound connection once. Inbound peers are not redialed (we can't reach
+/// them); when the link dies the task simply ends and the remote's reconnect re-establishes it.
+fn spawn_inbound(
+    stream: TcpStream,
+    id: PeerId,
+    mut line_rx: mpsc::UnboundedReceiver<String>,
+    to_ui: mpsc::UnboundedSender<NetEvent>,
+    done_tx: mpsc::UnboundedSender<PeerId>,
+) {
+    tokio::spawn(async move {
+        let framed = Framed::new(stream, LinesCodec::new());
+        if let ConnEnd::Lost(e) = run_connection(framed, id, &to_ui, &mut line_rx).await {
+            let _ = to_ui.send(NetEvent::PeerError { peer: id, err: e });
+        }
+        let _ = done_tx.send(id);
+    });
+}
+
+/// Dial an outbound peer through Tor's SOCKS5 proxy and run it, **reconnecting with backoff**
+/// after any non-deliberate drop. Loops until the manager closes our line channel (deliberate
+/// `/disconnect` or shutdown). Runs in its own task so slow circuits never stall the manager.
+fn spawn_outbound(
     id: PeerId,
     raw_onion: String,
-    line_rx: mpsc::UnboundedReceiver<String>,
+    mut line_rx: mpsc::UnboundedReceiver<String>,
     to_ui: mpsc::UnboundedSender<NetEvent>,
     done_tx: mpsc::UnboundedSender<PeerId>,
 ) {
     tokio::spawn(async move {
         let service_id = tor::normalize_onion(&raw_onion);
+        // "host:port" string → Tor resolves the .onion (never resolve locally).
         let target = format!("{service_id}.onion:{ONION_VIRTUAL_PORT}");
-        let _ = to_ui.send(NetEvent::Status(format!("dialing {target} via Tor…")));
+        let display = format!("{service_id}.onion");
+        let mut backoff = RECONNECT_BACKOFF_START;
 
-        // Hand the "host:port" string straight to SOCKS5 so *Tor* resolves the .onion — never
-        // resolve it locally.
-        match Socks5Stream::connect(SOCKS_ADDR, target.as_str()).await {
-            Ok(stream) => {
-                let _ = to_ui.send(NetEvent::PeerConnected {
-                    peer: id,
-                    onion: format!("{service_id}.onion"),
-                    inbound: false,
-                });
-                let framed = Framed::new(stream, LinesCodec::new());
-                peer_loop(framed, id, to_ui, line_rx, done_tx.clone()).await;
+        loop {
+            let _ = to_ui.send(NetEvent::Status(format!("dialing {target} via Tor…")));
+            match Socks5Stream::connect(SOCKS_ADDR, target.as_str()).await {
+                Ok(stream) => {
+                    backoff = RECONNECT_BACKOFF_START; // reset after a successful connect
+                    let _ = to_ui.send(NetEvent::PeerConnected {
+                        peer: id,
+                        onion: display.clone(),
+                        inbound: false,
+                    });
+                    let framed = Framed::new(stream, LinesCodec::new());
+                    match run_connection(framed, id, &to_ui, &mut line_rx).await {
+                        ConnEnd::LocalClosed => break, // deliberate disconnect / shutdown
+                        ConnEnd::Lost(e) => {
+                            let _ = to_ui.send(NetEvent::PeerError {
+                                peer: id,
+                                err: format!("{e} — reconnecting…"),
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = to_ui.send(NetEvent::PeerError {
+                        peer: id,
+                        err: format!("could not connect to {display}: {e} — retrying in {}s", backoff.as_secs()),
+                    });
+                }
             }
-            Err(e) => {
-                let _ = to_ui.send(NetEvent::PeerError {
-                    peer: id,
-                    err: format!("could not connect to {service_id}.onion: {e}"),
-                });
-                let _ = done_tx.send(id);
+
+            // Wait out the backoff, but stop immediately if the manager closed our channel.
+            if wait_or_closed(&mut line_rx, backoff).await {
+                break;
             }
+            backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
         }
+
+        let _ = done_tx.send(id);
     });
 }
 
-/// Pump one peer connection: forward inbound JSON lines to the UI as [`NetEvent::Message`], and
-/// write outgoing lines (handed over `line_rx` by the manager) to the socket. Generic over the
-/// underlying stream so it serves both inbound `TcpStream`s and outbound `Socks5Stream`s.
-async fn peer_loop<S>(
+/// Sleep for `dur`, returning `true` if the line channel was closed during the wait (the manager
+/// dropped our sender ⇒ deliberate disconnect). Any stray queued lines are dropped — the App
+/// blocks sends to offline peers, so this is only a rare in-flight straggler.
+async fn wait_or_closed(line_rx: &mut mpsc::UnboundedReceiver<String>, dur: Duration) -> bool {
+    let sleep = time::sleep(dur);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            _ = &mut sleep => return false,
+            msg = line_rx.recv() => match msg {
+                Some(_dropped) => continue,
+                None => return true,
+            }
+        }
+    }
+}
+
+/// Pump one connection: forward inbound chat frames to the UI, write outgoing lines, answer
+/// pings, and enforce the heartbeat liveness deadline. Generic over the stream so it serves both
+/// inbound `TcpStream`s and outbound `Socks5Stream`s.
+async fn run_connection<S>(
     framed: Framed<S, LinesCodec>,
     id: PeerId,
-    to_ui: mpsc::UnboundedSender<NetEvent>,
-    mut line_rx: mpsc::UnboundedReceiver<String>,
-    done_tx: mpsc::UnboundedSender<PeerId>,
-) where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    to_ui: &mpsc::UnboundedSender<NetEvent>,
+    line_rx: &mut mpsc::UnboundedReceiver<String>,
+) -> ConnEnd
+where
+    S: AsyncRead + AsyncWrite + Unpin,
 {
     let (mut sink, mut stream) = framed.split();
+    let mut heartbeat = time::interval(PING_INTERVAL);
+    heartbeat.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    let mut last_seen = Instant::now();
 
     loop {
         tokio::select! {
             incoming = stream.next() => match incoming {
-                Some(Ok(line)) => match WireMsg::from_line(&line) {
-                    Ok(msg) => { let _ = to_ui.send(NetEvent::Message { peer: id, msg }); }
-                    Err(e) => { let _ = to_ui.send(NetEvent::Status(format!("dropped malformed message: {e}"))); }
-                },
-                Some(Err(e)) => {
-                    let _ = to_ui.send(NetEvent::PeerError { peer: id, err: e.to_string() });
-                    break;
-                }
-                None => {
-                    let _ = to_ui.send(NetEvent::PeerDisconnected { peer: id });
-                    break;
-                }
-            },
-            outgoing = line_rx.recv() => match outgoing {
-                Some(line) => {
-                    if let Err(e) = sink.send(line).await {
-                        let _ = to_ui.send(NetEvent::PeerError { peer: id, err: e.to_string() });
-                        break;
+                Some(Ok(line)) => {
+                    last_seen = Instant::now();
+                    match Frame::from_line(&line) {
+                        Ok(Frame::Msg(msg)) => { let _ = to_ui.send(NetEvent::Message { peer: id, msg }); }
+                        Ok(Frame::Ping) => {
+                            if sink.send(pong_line()).await.is_err() {
+                                return ConnEnd::Lost("write failed".into());
+                            }
+                        }
+                        Ok(Frame::Pong) => {}
+                        Err(e) => { let _ = to_ui.send(NetEvent::Status(format!("dropped malformed frame: {e}"))); }
                     }
                 }
-                // Manager dropped our line channel (explicit disconnect / shutdown). Exit quietly.
-                None => break,
+                Some(Err(e)) => return ConnEnd::Lost(e.to_string()),
+                None => return ConnEnd::Lost("connection closed by peer".into()),
+            },
+
+            outgoing = line_rx.recv() => match outgoing {
+                Some(line) => {
+                    if sink.send(line).await.is_err() {
+                        return ConnEnd::Lost("write failed".into());
+                    }
+                }
+                None => return ConnEnd::LocalClosed,
+            },
+
+            _ = heartbeat.tick() => {
+                if last_seen.elapsed() > LIVENESS_TIMEOUT {
+                    return ConnEnd::Lost("peer unresponsive (heartbeat timeout)".into());
+                }
+                if sink.send(ping_line()).await.is_err() {
+                    return ConnEnd::Lost("write failed".into());
+                }
             }
         }
     }
-
-    let _ = done_tx.send(id);
 }
