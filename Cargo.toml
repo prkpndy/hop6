@@ -2,6 +2,7 @@
 name = "hop6"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
 description = "Serverless, peer-to-peer terminal messenger that speaks exclusively over Tor v3 onion services"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/prkpndy/hop6"

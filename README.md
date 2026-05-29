@@ -23,7 +23,7 @@ its own `.onion` address and connects directly to peers' onion addresses through
 
 ## Prerequisites
 
-1. **Rust** (edition 2021; stable toolchain).
+1. **Rust 1.85+** (edition 2021; stable toolchain).
 2. **A running Tor daemon** on the same machine, with the SOCKS port, control port, and cookie
    authentication enabled.
 
