@@ -87,7 +87,10 @@ impl App {
 
     /// Short display label for our own identity.
     fn me(&self) -> String {
-        self.own_onion.as_deref().map(short_onion).unwrap_or_else(|| "me".to_string())
+        self.own_onion
+            .as_deref()
+            .map(short_onion)
+            .unwrap_or_else(|| "me".to_string())
     }
 
     // ── Input handling ──────────────────────────────────────────────────────────────────
@@ -156,7 +159,9 @@ impl App {
                     None
                 } else {
                     self.sys(format!("connecting to {arg}…"));
-                    Some(AppAction::Command(UiCommand::Connect { onion: arg.to_string() }))
+                    Some(AppAction::Command(UiCommand::Connect {
+                        onion: arg.to_string(),
+                    }))
                 }
             }
             "disconnect" | "d" => match self.active {
@@ -191,7 +196,11 @@ impl App {
                         self.sys("that peer is disconnected");
                         return None;
                     }
-                    p.log.push(ChatLine { from_me: true, who: me, body: body.clone() });
+                    p.log.push(ChatLine {
+                        from_me: true,
+                        who: me,
+                        body: body.clone(),
+                    });
                     self.scroll = 0; // jump to newest
                     return Some(AppAction::Command(UiCommand::Send { peer, body }));
                 }
@@ -212,11 +221,13 @@ impl App {
         let lines: Vec<String> = self
             .order
             .iter()
-            .filter_map(|id| self.peers.get(id).map(|p| {
-                let state = if p.connected { "online" } else { "offline" };
-                let dir = if p.inbound { "in" } else { "out" };
-                format!("  [{id}] {} ({dir}, {state})", p.label())
-            }))
+            .filter_map(|id| {
+                self.peers.get(id).map(|p| {
+                    let state = if p.connected { "online" } else { "offline" };
+                    let dir = if p.inbound { "in" } else { "out" };
+                    format!("  [{id}] {} ({dir}, {state})", p.label())
+                })
+            })
             .collect();
         self.sys("peers:");
         for l in lines {
@@ -249,7 +260,12 @@ impl App {
         // Build a virtual list: [None, peer0, peer1, ...].
         let cur = match self.active {
             None => 0,
-            Some(id) => self.order.iter().position(|&p| p == id).map(|i| i + 1).unwrap_or(0),
+            Some(id) => self
+                .order
+                .iter()
+                .position(|&p| p == id)
+                .map(|i| i + 1)
+                .unwrap_or(0),
         };
         let len = self.order.len() as i32 + 1;
         let next = (cur as i32 + delta).rem_euclid(len);
@@ -269,12 +285,21 @@ impl App {
                 self.status = format!("online · {}", short_onion(&onion));
                 self.own_onion = Some(onion);
             }
-            NetEvent::PeerConnected { peer, onion, inbound } => {
+            NetEvent::PeerConnected {
+                peer,
+                onion,
+                inbound,
+            } => {
                 if !self.peers.contains_key(&peer) {
                     self.order_push(peer);
                     self.peers.insert(
                         peer,
-                        Peer { onion: String::new(), inbound, connected: false, log: Vec::new() },
+                        Peer {
+                            onion: String::new(),
+                            inbound,
+                            connected: false,
+                            log: Vec::new(),
+                        },
                     );
                 }
                 let entry = self.peers.get_mut(&peer).expect("just inserted");
@@ -310,7 +335,11 @@ impl App {
                         p.onion = msg.from_onion.clone();
                     }
                     let who = short_onion(&msg.from_onion);
-                    p.log.push(ChatLine { from_me: false, who, body: msg.body });
+                    p.log.push(ChatLine {
+                        from_me: false,
+                        who,
+                        body: msg.body,
+                    });
                     if self.active == Some(peer) {
                         self.scroll = 0;
                     }
@@ -335,6 +364,16 @@ impl App {
     pub fn on_tick(&mut self) {}
 }
 
+/// Shorten a `.onion` to `abcd1234…` for compact display.
+pub fn short_onion(onion: &str) -> String {
+    let id = onion.strip_suffix(".onion").unwrap_or(onion);
+    if id.len() > 8 {
+        format!("{}…", &id[..8])
+    } else {
+        id.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,7 +396,9 @@ mod tests {
         let mut app = App::new();
         let action = type_line(&mut app, "/connect abc.onion");
         match action {
-            Some(AppAction::Command(UiCommand::Connect { onion })) => assert_eq!(onion, "abc.onion"),
+            Some(AppAction::Command(UiCommand::Connect { onion })) => {
+                assert_eq!(onion, "abc.onion")
+            }
             _ => panic!("expected a Connect command"),
         }
     }
@@ -428,15 +469,5 @@ mod tests {
             msg: WireMsg::new("xyz.onion", "hello", 1),
         });
         assert_eq!(app.peers[&2].onion, "xyz.onion");
-    }
-}
-
-/// Shorten a `.onion` to `abcd1234…` for compact display.
-pub fn short_onion(onion: &str) -> String {
-    let id = onion.strip_suffix(".onion").unwrap_or(onion);
-    if id.len() > 8 {
-        format!("{}…", &id[..8])
-    } else {
-        id.to_string()
     }
 }

@@ -42,14 +42,19 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
         .as_deref()
         .unwrap_or("(publishing onion service…)");
     let line = Line::from(vec![
-        Span::styled("hop6", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "hop6",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw("  you: "),
         Span::styled(identity, Style::default().fg(Color::Cyan)),
         Span::raw("   "),
         Span::styled(app.status.clone(), Style::default().fg(Color::Yellow)),
     ]);
-    let widget = Paragraph::new(line)
-        .block(Block::default().borders(Borders::ALL).title(" status "));
+    let widget =
+        Paragraph::new(line).block(Block::default().borders(Borders::ALL).title(" status "));
     frame.render_widget(widget, area);
 }
 
@@ -71,8 +76,7 @@ fn render_roster(frame: &mut Frame, area: Rect, app: &App) {
         }
     }
 
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(" peers "));
+    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(" peers "));
     frame.render_widget(list, area);
 }
 
@@ -133,9 +137,13 @@ fn build_chat_lines(app: &App) -> (String, Vec<Line<'static>>) {
                 .iter()
                 .map(|c| {
                     let who_style = if c.from_me {
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD)
                     };
                     Line::from(vec![
                         Span::styled(format!("{}: ", c.who), who_style),
@@ -161,7 +169,11 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled("> ", Style::default().fg(Color::Magenta)),
         Span::raw(app.input.clone()),
     ]))
-    .block(Block::default().borders(Borders::ALL).title(" input (Enter=send · /help) "));
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" input (Enter=send · /help) "),
+    );
     frame.render_widget(widget, area);
 
     // Place the cursor right after the typed text (account for the "> " prompt + left border).

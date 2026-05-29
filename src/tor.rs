@@ -54,7 +54,9 @@ pub async fn start_onion(local_port: u16) -> Result<(String, Control)> {
         .make_auth_data()
         .context("failed to read Tor auth cookie (is the cookie file readable by this user?)")?
         .ok_or_else(|| {
-            anyhow!("Tor offered no usable auth method — add `CookieAuthentication 1` to your torrc")
+            anyhow!(
+                "Tor offered no usable auth method — add `CookieAuthentication 1` to your torrc"
+            )
         })?;
     uconn
         .authenticate(&auth)
