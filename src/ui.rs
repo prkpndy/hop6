@@ -67,11 +67,7 @@ fn render_roster(frame: &mut Frame, area: Rect, app: &App) {
     for &id in &app.order {
         if let Some(p) = app.peers.get(&id) {
             let selected = app.active == Some(id);
-            let label = if p.onion.is_empty() {
-                format!("[{id}] (incoming)")
-            } else {
-                format!("[{id}] {}", crate::app::short_onion(&p.onion))
-            };
+            let label = format!("[{id}] {}", app.display_name(&p.onion));
             items.push(roster_item(&label, selected, p.connected));
         }
     }
@@ -123,15 +119,11 @@ fn build_chat_lines(app: &App) -> (String, Vec<Line<'static>>) {
             let Some(p) = app.peers.get(&id) else {
                 return (" chat ".to_string(), Vec::new());
             };
-            let title = if p.onion.is_empty() {
-                format!(" chat · [{id}] (incoming){} ", conn_suffix(p.connected))
-            } else {
-                format!(
-                    " chat · [{id}] {}{} ",
-                    crate::app::short_onion(&p.onion),
-                    conn_suffix(p.connected)
-                )
-            };
+            let title = format!(
+                " chat · [{id}] {}{} ",
+                app.display_name(&p.onion),
+                conn_suffix(p.connected)
+            );
             let lines = p
                 .log
                 .iter()

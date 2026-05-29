@@ -14,3 +14,6 @@
 
 # Persisted onion identity keys (never commit a secret key)
 *.key
+
+# Persisted address book (your social graph — keep it private)
+contacts.json

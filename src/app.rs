@@ -7,7 +7,9 @@ use std::collections::HashMap;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::contacts::Book;
 use crate::message::{NetEvent, PeerId, UiCommand};
+use crate::tor::normalize_onion;
 
 /// What the main loop should do after handling a key.
 pub enum AppAction {
@@ -15,6 +17,8 @@ pub enum AppAction {
     Quit,
     /// A command to forward to the network manager.
     Command(UiCommand),
+    /// The contacts book changed; the main loop should persist it to disk.
+    PersistContacts,
 }
 
 /// One rendered line in a conversation.
@@ -32,17 +36,6 @@ pub struct Peer {
     pub inbound: bool,
     pub connected: bool,
     pub log: Vec<ChatLine>,
-}
-
-impl Peer {
-    /// Roster label: the short onion, or a placeholder while the identity is still unknown.
-    fn label(&self) -> String {
-        if self.onion.is_empty() {
-            "(incoming)".to_string()
-        } else {
-            short_onion(&self.onion)
-        }
-    }
 }
 
 /// Whole-application state.
@@ -63,10 +56,12 @@ pub struct App {
     pub input: String,
     /// Lines scrolled up from the bottom of the active conversation (0 = pinned to newest).
     pub scroll: usize,
+    /// Saved `name -> bare onion id` address book, loaded at startup.
+    pub contacts: Book,
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub fn new(contacts: Book) -> Self {
         let mut app = App {
             own_onion: None,
             status: "starting — publishing onion service…".to_string(),
@@ -76,6 +71,7 @@ impl App {
             system: Vec::new(),
             input: String::new(),
             scroll: 0,
+            contacts,
         };
         app.sys("Welcome to hop6. Type /help for commands.");
         app
@@ -91,6 +87,19 @@ impl App {
             .as_deref()
             .map(short_onion)
             .unwrap_or_else(|| "me".to_string())
+    }
+
+    /// Human-friendly label for an onion address: the saved contact name if we know one, else a
+    /// shortened onion, or `(incoming)` while a peer's identity is still unknown.
+    pub fn display_name(&self, onion: &str) -> String {
+        if onion.is_empty() {
+            return "(incoming)".to_string();
+        }
+        let id = normalize_onion(onion);
+        match self.contacts.iter().find(|(_, v)| **v == id) {
+            Some((name, _)) => name.clone(),
+            None => short_onion(onion),
+        }
     }
 
     // ── Input handling ──────────────────────────────────────────────────────────────────
@@ -155,13 +164,13 @@ impl App {
         match cmd {
             "connect" | "c" => {
                 if arg.is_empty() {
-                    self.sys("usage: /connect <onion-address>");
+                    self.sys("usage: /connect <name|onion>");
                     None
                 } else {
-                    self.sys(format!("connecting to {arg}…"));
-                    Some(AppAction::Command(UiCommand::Connect {
-                        onion: arg.to_string(),
-                    }))
+                    // Resolve a saved contact name; otherwise treat the arg as a raw onion.
+                    let onion = self.contacts.get(arg).cloned().unwrap_or_else(|| arg.to_string());
+                    self.sys(format!("connecting to {}…", self.display_name(&onion)));
+                    Some(AppAction::Command(UiCommand::Connect { onion }))
                 }
             }
             "disconnect" | "d" => match self.active {
@@ -171,6 +180,12 @@ impl App {
                     None
                 }
             },
+            "add" => self.add_contact(arg),
+            "remove" | "rm" => self.remove_contact(arg),
+            "contacts" => {
+                self.list_contacts();
+                None
+            }
             "peers" => {
                 self.list_peers();
                 None
@@ -184,6 +199,49 @@ impl App {
                 self.sys(format!("unknown command: /{other} (try /help)"));
                 None
             }
+        }
+    }
+
+    /// `/add <name> <onion>` — save a contact and request persistence.
+    fn add_contact(&mut self, arg: &str) -> Option<AppAction> {
+        let mut parts = arg.splitn(2, char::is_whitespace);
+        let name = parts.next().unwrap_or("").trim();
+        let onion = parts.next().unwrap_or("").trim();
+        if name.is_empty() || onion.is_empty() {
+            self.sys("usage: /add <name> <onion>");
+            return None;
+        }
+        let id = normalize_onion(onion);
+        self.contacts.insert(name.to_string(), id);
+        self.sys(format!("saved contact '{name}'"));
+        Some(AppAction::PersistContacts)
+    }
+
+    /// `/remove <name>` — forget a contact and request persistence.
+    fn remove_contact(&mut self, name: &str) -> Option<AppAction> {
+        if name.is_empty() {
+            self.sys("usage: /remove <name>");
+            None
+        } else if self.contacts.remove(name).is_some() {
+            self.sys(format!("removed contact '{name}'"));
+            Some(AppAction::PersistContacts)
+        } else {
+            self.sys(format!("no contact named '{name}'"));
+            None
+        }
+    }
+
+    fn list_contacts(&mut self) {
+        if self.contacts.is_empty() {
+            self.sys("no saved contacts — add one with /add <name> <onion>");
+            return;
+        }
+        let mut entries: Vec<(String, String)> =
+            self.contacts.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        self.sys("contacts:");
+        for (name, onion) in entries {
+            self.sys(format!("  {name} → {}", short_onion(&onion)));
         }
     }
 
@@ -218,31 +276,36 @@ impl App {
             self.sys("no peers yet");
             return;
         }
-        let lines: Vec<String> = self
+        // Snapshot first so we don't borrow self.peers while calling display_name(&self).
+        let snap: Vec<(PeerId, String, bool, bool)> = self
             .order
             .iter()
             .filter_map(|id| {
-                self.peers.get(id).map(|p| {
-                    let state = if p.connected { "online" } else { "offline" };
-                    let dir = if p.inbound { "in" } else { "out" };
-                    format!("  [{id}] {} ({dir}, {state})", p.label())
-                })
+                self.peers
+                    .get(id)
+                    .map(|p| (*id, p.onion.clone(), p.connected, p.inbound))
             })
             .collect();
         self.sys("peers:");
-        for l in lines {
-            self.sys(l);
+        for (id, onion, connected, inbound) in snap {
+            let state = if connected { "online" } else { "offline" };
+            let dir = if inbound { "in" } else { "out" };
+            let label = self.display_name(&onion);
+            self.sys(format!("  [{id}] {label} ({dir}, {state})"));
         }
     }
 
     fn print_help(&mut self) {
         for l in [
             "commands:",
-            "  /connect <onion>   dial a peer (alias /c)",
-            "  /disconnect        drop the active peer (alias /d)",
-            "  /peers             list known peers",
-            "  /quit              exit (alias /q; also Esc or Ctrl+C)",
-            "  /help              this help (alias /h)",
+            "  /connect <name|onion>  dial a saved contact or a raw onion (alias /c)",
+            "  /add <name> <onion>    save a contact",
+            "  /remove <name>         forget a contact (alias /rm)",
+            "  /contacts              list saved contacts",
+            "  /disconnect            drop the active peer (alias /d)",
+            "  /peers                 list connected peers",
+            "  /quit                  exit (alias /q; also Esc or Ctrl+C)",
+            "  /help                  this help (alias /h)",
             "keys: Tab/↑/↓ switch conversation · PgUp/PgDn scroll · Enter send",
         ] {
             self.sys(l);
@@ -308,7 +371,7 @@ impl App {
                 if !onion.is_empty() {
                     entry.onion = onion.clone();
                 }
-                let label = self.peers.get(&peer).map(|p| p.label()).unwrap_or_default();
+                let label = self.display_name(&onion);
                 let dir = if inbound { "incoming" } else { "outgoing" };
                 self.sys(format!("[{peer}] connected ({dir}): {label}"));
                 if self.active.is_none() {
@@ -316,9 +379,12 @@ impl App {
                 }
             }
             NetEvent::PeerDisconnected { peer } => {
-                if let Some(p) = self.peers.get_mut(&peer) {
+                let onion = self.peers.get_mut(&peer).map(|p| {
                     p.connected = false;
-                    let label = p.label();
+                    p.onion.clone()
+                });
+                if let Some(onion) = onion {
+                    let label = self.display_name(&onion);
                     self.sys(format!("[{peer}] disconnected: {label}"));
                 }
             }
@@ -329,12 +395,13 @@ impl App {
                 self.sys(format!("[{peer}] error: {err}"));
             }
             NetEvent::Message { peer, msg } => {
+                // Resolve the sender's display name (contact name if known) before borrowing peers.
+                let who = self.display_name(&msg.from_onion);
                 // Learn an inbound peer's identity from its first message.
                 if let Some(p) = self.peers.get_mut(&peer) {
                     if p.onion.is_empty() && !msg.from_onion.is_empty() {
                         p.onion = msg.from_onion.clone();
                     }
-                    let who = short_onion(&msg.from_onion);
                     p.log.push(ChatLine {
                         from_me: false,
                         who,
@@ -384,6 +451,10 @@ mod tests {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
     }
 
+    fn app() -> App {
+        App::new(Book::new())
+    }
+
     fn type_line(app: &mut App, text: &str) -> Option<AppAction> {
         for c in text.chars() {
             app.on_key(key(c));
@@ -393,7 +464,7 @@ mod tests {
 
     #[test]
     fn slash_connect_emits_connect_command() {
-        let mut app = App::new();
+        let mut app = app();
         let action = type_line(&mut app, "/connect abc.onion");
         match action {
             Some(AppAction::Command(UiCommand::Connect { onion })) => {
@@ -405,7 +476,7 @@ mod tests {
 
     #[test]
     fn esc_and_ctrl_c_quit() {
-        let mut app = App::new();
+        let mut app = app();
         assert!(matches!(
             app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             Some(AppAction::Quit)
@@ -418,14 +489,14 @@ mod tests {
 
     #[test]
     fn typing_without_active_peer_does_not_send() {
-        let mut app = App::new();
+        let mut app = app();
         let action = type_line(&mut app, "hello");
         assert!(action.is_none(), "no active peer → no Send");
     }
 
     #[test]
     fn message_to_connected_peer_round_trips_through_state() {
-        let mut app = App::new();
+        let mut app = app();
         // A peer connects (outbound) and becomes active automatically.
         app.apply_net_event(NetEvent::PeerConnected {
             peer: 1,
@@ -457,7 +528,7 @@ mod tests {
 
     #[test]
     fn inbound_peer_learns_identity_from_first_message() {
-        let mut app = App::new();
+        let mut app = app();
         app.apply_net_event(NetEvent::PeerConnected {
             peer: 2,
             onion: String::new(), // unknown for inbound
@@ -469,5 +540,40 @@ mod tests {
             msg: WireMsg::new("xyz.onion", "hello", 1),
         });
         assert_eq!(app.peers[&2].onion, "xyz.onion");
+    }
+
+    #[test]
+    fn add_then_connect_resolves_name_and_labels_peer() {
+        let mut app = app();
+
+        // /add saves the contact (normalized, no .onion suffix) and asks to persist.
+        let action = type_line(&mut app, "/add alice abc.onion");
+        assert!(matches!(action, Some(AppAction::PersistContacts)));
+        assert_eq!(app.contacts.get("alice").map(String::as_str), Some("abc"));
+
+        // /connect by name resolves to the saved onion.
+        let action = type_line(&mut app, "/connect alice");
+        match action {
+            Some(AppAction::Command(UiCommand::Connect { onion })) => assert_eq!(onion, "abc"),
+            _ => panic!("expected a Connect command"),
+        }
+
+        // A peer at that onion is labeled with the contact name, in any onion form.
+        assert_eq!(app.display_name("abc.onion"), "alice");
+        assert_eq!(app.display_name("abc"), "alice");
+        assert_eq!(app.display_name(""), "(incoming)");
+    }
+
+    #[test]
+    fn remove_contact_persists_and_forgets() {
+        let mut app = app();
+        type_line(&mut app, "/add bob def.onion");
+        let action = type_line(&mut app, "/remove bob");
+        assert!(matches!(action, Some(AppAction::PersistContacts)));
+        assert!(!app.contacts.contains_key("bob"));
+
+        // Removing a missing contact does not request persistence.
+        let action = type_line(&mut app, "/remove nobody");
+        assert!(action.is_none());
     }
 }

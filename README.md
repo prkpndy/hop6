@@ -87,6 +87,22 @@ your address stays the same every run.
 - A persistent onion is a **stable, linkable identity** — that's the point, but anyone you've
   shared it with can recognize you across sessions. Delete the key to become unlinkable again.
 
+### Contacts (address book)
+
+So you don't paste 56-character onion addresses every time, hop6 keeps a saved `name -> onion`
+address book.
+
+- Save a friend once: `/add alice <their-onion>`. Then dial them by name: `/connect alice`.
+- `/connect` falls back to treating its argument as a raw onion if it isn't a known name, so
+  both `/connect alice` and `/connect <onion>` work.
+- The roster, chat title, and incoming messages show the **contact's name** instead of a
+  shortened onion whenever the address matches a saved contact — so even an inbound connection
+  from a known friend shows up as "alice" rather than `(incoming)`.
+- `/contacts` lists what you've saved; `/remove alice` forgets a contact.
+- Stored at `~/.config/hop6/contacts.json` (override with `$HOP6_CONTACTS`), written `0600` in
+  a `0700` directory. This file is your **social graph** (who you talk to) — sensitive metadata,
+  so keep it private and don't commit it.
+
 ### Running two instances on one machine (loopback test)
 
 Each instance needs its own local listener port, so give the second one `--port`:
@@ -116,9 +132,12 @@ Type in the input box at the bottom.
 - **Slash commands:**
   | command | alias | effect |
   |---|---|---|
-  | `/connect <onion>` | `/c` | dial a peer by `.onion` address (with or without the `.onion` suffix) |
+  | `/connect <name\|onion>` | `/c` | dial a saved contact by name, or a raw `.onion` address (with or without the suffix) |
+  | `/add <name> <onion>` | | save a contact under a memorable name |
+  | `/remove <name>` | `/rm` | forget a saved contact |
+  | `/contacts` | | list saved contacts in the system log |
   | `/disconnect` | `/d` | drop the focused conversation |
-  | `/peers` | | list known peers in the system log |
+  | `/peers` | | list connected peers in the system log |
   | `/quit` | `/q` | exit |
   | `/help` | `/h` | show help |
 

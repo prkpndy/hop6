@@ -22,12 +22,14 @@
 //! [`run_ui`] simply keeps servicing keystrokes and redraws while network events trickle in.
 
 mod app;
+mod contacts;
 mod message;
 mod network;
 mod tor;
 mod ui;
 mod wire;
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -84,10 +86,27 @@ async fn main() -> Result<()> {
         key_path.display()
     )));
 
+    // Load the saved address book (missing file → empty; corrupt file → warn but continue).
+    let contacts_path = contacts::path()?;
+    let contacts_book = match contacts::load(&contacts_path) {
+        Ok(book) => book,
+        Err(e) => {
+            let _ = net_tx.send(NetEvent::Status(format!("could not load contacts: {e}")));
+            contacts::Book::new()
+        }
+    };
+
     // Enter the TUI. ratatui::init() switches to the alternate screen + raw mode; restore()
     // undoes it. We run the loop inside a closure so we always restore, even on error.
     let terminal = ratatui::init();
-    let result = run_ui(terminal, App::new(), net_rx, cmd_tx.clone()).await;
+    let result = run_ui(
+        terminal,
+        App::new(contacts_book),
+        net_rx,
+        cmd_tx.clone(),
+        contacts_path,
+    )
+    .await;
     ratatui::restore();
 
     // Best-effort: ask the network manager to shut down.
@@ -104,6 +123,7 @@ async fn run_ui(
     mut app: App,
     mut net_rx: mpsc::UnboundedReceiver<NetEvent>,
     cmd_tx: mpsc::UnboundedSender<UiCommand>,
+    contacts_path: PathBuf,
 ) -> Result<()> {
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
@@ -119,6 +139,13 @@ async fn run_ui(
                         match app.on_key(key) {
                             Some(AppAction::Quit) => break,
                             Some(AppAction::Command(cmd)) => { let _ = cmd_tx.send(cmd); }
+                            Some(AppAction::PersistContacts) => {
+                                if let Err(e) = contacts::save(&contacts_path, &app.contacts) {
+                                    app.apply_net_event(NetEvent::Status(
+                                        format!("could not save contacts: {e}"),
+                                    ));
+                                }
+                            }
                             None => {}
                         }
                     }
