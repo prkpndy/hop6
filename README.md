@@ -1,13 +1,13 @@
 # hop6
 
 A serverless, peer-to-peer, terminal (TUI) messenger that communicates **exclusively over the
-Tor network** using ephemeral **v3 onion services**. There is no central server: each instance
-publishes its own `.onion` address and connects directly to peers' onion addresses through Tor.
+Tor network** using **v3 onion services**. There is no central server: each instance publishes
+its own `.onion` address and connects directly to peers' onion addresses through Tor.
 
 - **TUI:** [`ratatui`] + [`crossterm`]
 - **Async runtime:** [`tokio`]
-- **Inbound:** an ephemeral v3 onion service created at runtime via Tor's **control port**
-  (`ADD_ONION`), forwarding to a local TCP listener
+- **Inbound:** a v3 onion service published at runtime via Tor's **control port** (`ADD_ONION`)
+  from a persisted key (stable address across restarts), forwarding to a local TCP listener
 - **Outbound:** TCP dialed through Tor's **SOCKS5 proxy** so Tor resolves the `.onion`
 - **Wire format:** newline-delimited JSON
 
@@ -65,10 +65,27 @@ cargo build
 cargo run            # listens on 127.0.0.1:8080 by default
 ```
 
-On startup hop6 connects to the control port, publishes an ephemeral onion service, and shows
-**your `.onion` address** in the status bar (and in the `*system` log). Publishing can take a
-few seconds. Share that address with whoever you want to chat with (out-of-band — e.g. Signal,
-in person; the address is your identity).
+On startup hop6 connects to the control port, publishes its onion service, and shows **your
+`.onion` address** in the status bar (and in the `*system` log). Publishing can take a few
+seconds. Share that address with whoever you want to chat with (out-of-band — e.g. Signal, in
+person; the address is your identity).
+
+### Persistent identity
+
+Your `.onion` address is derived from a secret key that hop6 **persists across restarts**, so
+your address stays the same every run.
+
+- On first run hop6 generates the key and saves it to `~/.config/hop6/identity.key`
+  (directory `0700`, file `0600` — treat it like an SSH private key). Later runs reload it.
+- The `*system` log shows whether the identity was `created new` or `loaded`, and from where.
+- Override the location with the `HOP6_IDENTITY` environment variable:
+  ```sh
+  HOP6_IDENTITY=./peer-a.key cargo run -- --port 8080
+  HOP6_IDENTITY=./peer-b.key cargo run -- --port 8081   # distinct identity on the same host
+  ```
+- To rotate your identity, delete the key file (a new address is generated next run).
+- A persistent onion is a **stable, linkable identity** — that's the point, but anyone you've
+  shared it with can recognize you across sessions. Delete the key to become unlinkable again.
 
 ### Running two instances on one machine (loopback test)
 
@@ -143,8 +160,9 @@ connection events, dial progress, and errors.
 
 All network I/O lives in spawned `tokio` tasks that talk to the UI **only** through `mpsc`
 channels, so the interface never freezes while a slow Tor circuit is being built. The onion
-service is created with `detach = false`, so it exists only while hop6 is running and vanishes
-on exit.
+service is published with `detach = false`, so it's torn down when hop6 exits — but because the
+**secret key is persisted to disk** and reloaded on the next run, your `.onion` address stays
+the same across restarts (see [Persistent identity](#persistent-identity)).
 
 ## Limitations (it's a prototype)
 

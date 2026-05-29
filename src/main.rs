@@ -50,15 +50,16 @@ async fn main() -> Result<()> {
     let (net_tx, net_rx) = mpsc::unbounded_channel::<NetEvent>();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
 
-    // Publish our ephemeral onion BEFORE entering the alternate screen, so any Tor error is
-    // printed plainly to the normal terminal instead of being clobbered by the TUI.
-    let (onion, control) = tor::start_onion(local_port)
+    // Publish our onion BEFORE entering the alternate screen, so any Tor error is printed
+    // plainly to the normal terminal instead of being clobbered by the TUI. The key is loaded
+    // from disk (or generated on first run) so the address is stable across restarts.
+    let tor::Identity { onion, control, key_path, created } = tor::start_onion(local_port)
         .await
         .context("failed to publish onion service")?;
 
     // Keep the control connection alive for the whole program: dropping it tears down the
-    // ephemeral onion (we created it with detach=false). Parking it in a task that owns it is
-    // the simplest way to tie its lifetime to the process.
+    // onion service (created with detach=false). Parking it in a task that owns it is the
+    // simplest way to tie its lifetime to the process.
     tokio::spawn(async move {
         let _control = control;
         std::future::pending::<()>().await;
@@ -75,8 +76,13 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Tell the UI our identity right away.
+    // Tell the UI our identity right away, plus where it's persisted.
     let _ = net_tx.send(NetEvent::OwnOnionReady { onion });
+    let verb = if created { "created new" } else { "loaded" };
+    let _ = net_tx.send(NetEvent::Status(format!(
+        "identity {verb} from {}",
+        key_path.display()
+    )));
 
     // Enter the TUI. ratatui::init() switches to the alternate screen + raw mode; restore()
     // undoes it. We run the loop inside a closure so we always restore, even on error.
