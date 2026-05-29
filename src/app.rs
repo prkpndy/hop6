@@ -81,12 +81,10 @@ impl App {
         self.system.push(line.into());
     }
 
-    /// Short display label for our own identity.
+    /// Label for our own messages in the chat log. Always "you" — you don't need to recognize
+    /// your own onion address to know which lines are yours.
     fn me(&self) -> String {
-        self.own_onion
-            .as_deref()
-            .map(short_onion)
-            .unwrap_or_else(|| "me".to_string())
+        "you".to_string()
     }
 
     /// Human-friendly label for an onion address: the saved contact name if we know one, else a
@@ -516,6 +514,7 @@ mod tests {
         }
         assert_eq!(app.peers[&1].log.len(), 1);
         assert!(app.peers[&1].log[0].from_me);
+        assert_eq!(app.peers[&1].log[0].who, "you");
 
         // An inbound message appends to the same conversation and learns identity.
         app.apply_net_event(NetEvent::Message {
