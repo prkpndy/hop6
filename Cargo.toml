@@ -1,0 +1,33 @@
+[package]
+name = "hop6"
+version = "0.1.0"
+edition = "2021"
+description = "Serverless, peer-to-peer terminal messenger that speaks exclusively over Tor v3 onion services"
+
+[dependencies]
+# TUI. ratatui 0.30 bundles (and re-exports) crossterm 0.29 via its default backend feature.
+ratatui = "0.30"
+# We declare crossterm ourselves only to enable `event-stream`. It MUST stay pinned to the
+# same minor (0.29) that ratatui resolves, or the two crossterm crates won't unify and
+# `crossterm::event::Event` values from the EventStream won't match ratatui's expectations.
+crossterm = { version = "0.29", features = ["event-stream"] }
+
+# Async runtime + framed-codec helpers.
+tokio = { version = "1.52", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+# Outbound: dial peers through Tor's local SOCKS5 proxy (127.0.0.1:9050).
+tokio-socks = "0.5"
+
+# Inbound: talk to the Tor control port and publish an ephemeral v3 onion service.
+# Default features already include `v3` + `control` + `serialize`, which is all we need.
+torut = "0.2"
+
+# Wire format: newline-delimited JSON.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# `EventStream` yields futures-Stream items; we need StreamExt/FutureExt in the select loop.
+futures = "0.3"
+
+anyhow = "1"

@@ -1,0 +1,29 @@
+# ── hop6 sample torrc ────────────────────────────────────────────────────────
+# Minimal Tor configuration for running hop6. hop6 creates its onion service at
+# runtime over the control port (ADD_ONION), so you do NOT need any
+# HiddenServiceDir / HiddenServicePort lines here.
+#
+# Start Tor with this file:
+#     tor -f ./torrc.sample
+#
+# (Or merge these directives into your system torrc, typically
+#  /etc/tor/torrc or /usr/local/etc/tor/torrc, and restart the tor service.)
+
+# SOCKS5 proxy hop6 dials outbound peers through.
+SocksPort 9050
+
+# Control port hop6 uses to publish its ephemeral v3 onion service.
+ControlPort 9051
+
+# Authenticate the control connection with a cookie file (hop6 reads it
+# automatically via the control protocol). This is REQUIRED — without it hop6
+# cannot authenticate and will exit with a clear error at startup.
+CookieAuthentication 1
+
+# Optional but recommended: let processes owned by your user read the cookie
+# file. Enable this if you see "failed to read Tor auth cookie" because Tor
+# runs as a different user (e.g. the `debian-tor` / `_tor` system account).
+# CookieAuthFileGroupReadable 1
+
+# Optional: keep Tor's own logs out of your way while testing.
+# Log notice stdout

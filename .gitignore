@@ -1,0 +1,13 @@
+# Rust build artifacts
+/target
+
+# Backtrace / debug files
+*.pdb
+
+# IDE / editor
+/.idea
+/.vscode
+*.swp
+
+# OS cruft
+.DS_Store
