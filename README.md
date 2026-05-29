@@ -50,8 +50,16 @@ Run Tor with it directly (easiest for testing):
 tor -f ./torrc.sample
 ```
 
-Leave that running in its own terminal. (Alternatively, merge those three directives into your
-system `torrc` and restart the `tor` service.)
+Leave that running in its own terminal.
+
+**Or** run Tor as a background service using its system config:
+
+- **macOS (Homebrew):** add the three directives above to `/opt/homebrew/etc/tor/torrc`
+  (Apple Silicon; on Intel Macs it's `/usr/local/etc/tor/torrc`), then restart the service:
+  ```sh
+  brew services restart tor
+  ```
+- **Linux:** merge them into `/etc/tor/torrc`, then `sudo systemctl restart tor`.
 
 > **Cookie permissions:** hop6 reads Tor's control auth cookie. If Tor runs under a different
 > system user than you (common with the packaged service), add `CookieAuthFileGroupReadable 1`

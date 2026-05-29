@@ -3,11 +3,15 @@
 # runtime over the control port (ADD_ONION), so you do NOT need any
 # HiddenServiceDir / HiddenServicePort lines here.
 #
-# Start Tor with this file:
+# Start Tor with this file directly (easiest for testing):
 #     tor -f ./torrc.sample
 #
-# (Or merge these directives into your system torrc, typically
-#  /etc/tor/torrc or /usr/local/etc/tor/torrc, and restart the tor service.)
+# Or install it as your system Tor config and run Tor as a background service:
+#   - macOS (Homebrew, Apple Silicon): copy these directives into
+#       /opt/homebrew/etc/tor/torrc          (Intel Macs: /usr/local/etc/tor/torrc)
+#     then:  brew services restart tor
+#   - Linux: merge into /etc/tor/torrc, then restart the tor service
+#     (e.g. sudo systemctl restart tor).
 
 # SOCKS5 proxy hop6 dials outbound peers through.
 SocksPort 9050
